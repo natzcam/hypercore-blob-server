@@ -8,6 +8,8 @@ const ByteStream = require('hypercore-byte-stream')
 const getMimeType = require('get-mime-type')
 const { isEnded } = require('streamx')
 const resolveDriveFilename = require('./drive')
+const EventEmitter = require('events')
+const speedometer = require('speedometer')
 
 const blobId = {
   preencode (state, b) {
@@ -53,8 +55,11 @@ class BlobDownloader {
   }
 
   async _open () {
-    await this._getBlob()
-    if (!this.core || !this.blob) return
+    const { core, blob } = this.server._resolveBlob(this.key, { blob: this.blob, filename: this.filename, version: this.version }, true)
+    if (!core || !blob) return
+
+    this.core = core
+    this.blob = blob
     this.range = this.core.download({
       start: this.blob.blockOffset,
       length: this.blob.blockLength
@@ -63,6 +68,8 @@ class BlobDownloader {
 
   async done () {
     await this.opening
+    if (!this.range) return
+
     await this.range.done()
     await this.close()
   }
@@ -84,31 +91,95 @@ class BlobDownloader {
       this.range = null
     }
   }
+}
 
-  async _getBlob () {
-    const info = toInfo(this.key, this.blob, null, this.filename, this.version)
-    const core = await this.server._getCore(this.key, info, true)
-    if (core === null) return
-
+class Monitor extends EventEmitter {
+  constructor (core, blob) {
+    super()
     this.core = core
-    if (this.blob) return
+    this.blob = blob
+    this.uploadSpeedometer = speedometer()
+    this.downloadSpeedometer = speedometer()
 
-    let result = null
-    try {
-      result = await resolveDriveFilename(this.core, this.filename, this.version)
-    } catch {}
-
-    await this.core.close()
-
-    if (result !== null) {
-      info.key = result.key
-      info.drive = info.key
-      info.blob = result.blob
-      this.core = await this.server._getCore(result.key, info, true)
-      this.blob = result.blob
-    } else {
-      this.core = null
+    const stats = {
+      startTime: 0,
+      peers: this.core.peers.length,
+      speed: 0,
+      blocks: this.core.length,
+      bytes: this.core.byteLength, // bytes loaded during monitoring
+      targetBytes: this.core.byteLength,
+      percentage: 0
     }
+
+    this.uploadStats = { ...stats }
+    this.downloadStats = { ...stats }
+
+    this.core.on('append', this._onAppend)
+    this.core.on('peer-add', this._updatePeers)
+    this.core.on('peer-remove', this._updatePeers)
+    this.core.on('upload', this._onUpload)
+    this.core.on('download', this._onDownload)
+    // close monitor on core close
+    this.core.on('close', this.close)
+  }
+
+  // on each append, change the target bytes
+  _onAppend = () => {
+    console.log('append')
+    this.uploadStats.targetBytes = this.downloadStats.targetBytes = this.core.byteLength
+    this.emit('update')
+  }
+
+  _onUpload = (index, byteLength, from) => {
+    console.log('upload')
+    this._updateStats(this.uploadSpeedometer, this.uploadStats, index, byteLength, from)
+    this.emit('update')
+  }
+
+  _onDownload = (index, byteLength, from) => {
+    console.log('download')
+    this._updateStats(this.downloadSpeedometer, this.downloadStats, index, byteLength, from)
+    this.emit('update')
+  }
+
+  _updatePeers = () => {
+    this.uploadStats.peers = this.downloadStats.peers = this.core.peers.length
+    this.emit('update')
+  }
+
+  close = () => {
+    this.core.off('append', this._onAppend)
+    this.core.off('peer-add', this._updatePeers)
+    this.core.off('peer-remove', this._updatePeers)
+    this.core.off('upload', this._onUpload)
+    this.core.off('download', this._onDownload)
+  }
+
+  // just an alias
+  destroy () {
+    return this.close()
+  }
+
+  _updateStats (speed, stats, index, byteLength) {
+    if (!stats.startTime) stats.startTime = Date.now()
+    if (!isWithinRange(index, this.blob)) return
+
+    stats.speed = speed(byteLength)
+    stats.blocks++
+    stats.bytes += byteLength
+    stats.percentage = toFixed(stats.bytes / stats.targetBytes * 100)
+  }
+
+  downloadSpeed () {
+    return this.downloadSpeedometer()
+  }
+
+  uploadSpeed () {
+    return this.uploadSpeedometer()
+  }
+
+  get peers () {
+    return this.core.peers.length
   }
 }
 
@@ -134,6 +205,7 @@ module.exports = class HypercoreBlobServer {
     this.server = null
     this.connections = new Set()
     this.resolve = resolve
+    this.monitors = new Map()
 
     this.listening = null
     this.suspending = null
@@ -364,6 +436,9 @@ module.exports = class HypercoreBlobServer {
     if (this.listening) await this.listening
     await this._closeAll(true)
     await this.store.close()
+    for (const m of this.monitors) {
+      m.close()
+    }
   }
 
   async _listen () {
@@ -431,13 +506,7 @@ module.exports = class HypercoreBlobServer {
   }
 
   async clear (key, opts = {}) {
-    const { blob = null, drive = null, filename = null, version = 0 } = opts
-
-    if (!blob && !filename) {
-      throw new Error('Must specify a filename or blob')
-    }
-
-    const core = await this._getCore(key, toInfo(key, blob, drive, filename, version), false)
+    const { core, blob } = await this._resolveBlob(key, opts, false)
     if (core === null) return null
 
     if (blob) {
@@ -446,19 +515,49 @@ module.exports = class HypercoreBlobServer {
       return cleared
     }
 
+    return null
+  }
+
+  async monitor (key, opts = {}) {
+    const { core, blob } = await this._resolveBlob(key, opts, true)
+    if (core === null) return null
+
+    if (blob) {
+      if (this.monitors.has(core.key)) return this.monitors.get(core.key)
+
+      const monitor = new Monitor(core, blob)
+      this.monitors.set(core.key, monitor)
+      return monitor
+    }
+
+    return null
+  }
+
+  async _resolveBlob (key, { blob = null, filename = null, version = 0 }, wait) {
+    const blobInfo = { core: null, blob: null}
+    if (!blob && !filename) {
+      throw new Error('Must specify a filename or blob')
+    }
+
+    const core = await this._getCore(key, toInfo(key, blob, filename, version), wait)
+    if (core === null) return blobInfo
+
+    if (blob) {
+      return { core, blob }
+    }
+
     let result = null
     try {
       result = await resolveDriveFilename(core, filename, version)
     } catch {}
 
-    await core.close()
+    if (result !== null) return this._resolveBlob(result.key, { blob: result.blob, filename, version }, wait)
 
-    if (result !== null) return this.clear(result.key, { blob: result.blob, drive: key, filename, version })
-    return null
+    return blobInfo
   }
 }
 
-function toInfo (key, blob, drive, filename, version) {
+function toInfo (key, blob, filename, version) {
   return {
     head: null,
     range: null,
@@ -521,6 +620,14 @@ function parseRange (range) {
     start: Number(r[0] || 0),
     end: Number(r[1] === '' ? -1 : r[1])
   }
+}
+
+function toFixed (n) {
+  return Math.round(n * 100) / 100
+}
+
+function isWithinRange (index, { blockOffset, blockLength }) {
+  return index >= blockOffset && index < blockOffset + blockLength
 }
 
 function noop () {}
